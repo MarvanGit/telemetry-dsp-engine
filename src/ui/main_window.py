@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QCheckBox,
     QPushButton,
+    QComboBox
 )
 import pyqtgraph as pg
 from src.core.data_source import MockDataSource
@@ -99,12 +100,11 @@ class MainWindow(QMainWindow):
 
         self.curves = []
         self.plot_items = []
-        self.emg_data_buffer = np.zeros((1, 1000), dtype=np.float64)
-        self.channel_checkboxes = []
+        self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
+        # Channel selection combo box
+        self.channel_combo = None
         self.channel_controls_layout = QHBoxLayout()
         self.layout.addLayout(self.channel_controls_layout)
-
-        self.focused_channel = None
         self.load_data_source(self.data_file_path)
         self.statusBar().showMessage("Ready")
 
@@ -115,7 +115,7 @@ class MainWindow(QMainWindow):
         try:
             self.data_source = MockDataSource(file_path=file_path, chunk_size=50)
             self.num_channels = self.data_source.get_num_channels()
-            self.emg_data_buffer = np.zeros((self.num_channels, 1000), dtype=np.float64)
+            self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
             self.current_file_label.setText(f"File: {os.path.basename(file_path)}")
             self.sample_rate_label.setText(f"Sample Rate: {self.data_source.sampling_rate} Hz")
             self.channel_count_label.setText(f"Channels: {self.num_channels}")
@@ -125,7 +125,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.data_source = None
             self.num_channels = 0
-            self.emg_data_buffer = np.zeros((1, 1000), dtype=np.float64)
+            self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
             self.current_file_label.setText("File: -")
             self.sample_rate_label.setText("Sample Rate: -")
             self.channel_count_label.setText("Channels: -")
@@ -150,40 +150,36 @@ class MainWindow(QMainWindow):
         self.channel_controls_layout.setParent(None)
         self.channel_controls_layout = QHBoxLayout()
         self.layout.insertLayout(3, self.channel_controls_layout)
-        self.channel_checkboxes = []
-        self.graph_layout.setMinimumHeight(self.num_channels * 150)
+        
         for channel_index in range(self.num_channels):
             plot_item = self.graph_layout.addPlot(row=channel_index, col=0)
-            plot_item.setYRange(-self.current_gain, self.current_gain)
             plot_item.showGrid(x=True, y=True, alpha=0.3)
-            plot_item.setLabel("left", f"Channel {channel_index + 1}")
+            plot_item.setLabel("left", "EMG Amplitude (µV)")
+            plot_item.setLabel("bottom", "Sample Index (n)")
             curve = plot_item.plot(pen=pg.mkPen(color=(channel_index * 20 % 255, 100, 200), width=1))
             self.curves.append(curve)
             self.plot_items.append(plot_item)
             self.graph_layout.nextRow()
 
-            # Add checkbox for channel visibility
-            cb = QCheckBox(f"Ch {channel_index + 1}")
-            cb.setChecked(True)
-            cb.stateChanged.connect(lambda state, idx=channel_index: self.toggle_channel_visibility(idx, state))
-            self.channel_checkboxes.append(cb)
-            self.channel_controls_layout.addWidget(cb)
-
-            # Add focus button for single-channel focus
-            focus_btn = QPushButton(f"Focus {channel_index + 1}")
-            focus_btn.setCheckable(True)
-            focus_btn.clicked.connect(lambda checked, idx=channel_index: self.handle_focus_button(idx, checked))
-            self.channel_controls_layout.addWidget(focus_btn)
-
+        # Add combo box for channel selection
+        self.channel_combo = None
+        if self.num_channels > 0:
+            self.channel_combo = QComboBox()
+            for channel_index in range(self.num_channels):
+                self.channel_combo.addItem(f"Channel {channel_index + 1}", channel_index)
+            self.channel_combo.currentIndexChanged.connect(self.handle_channel_combo_changed)
+            self.channel_controls_layout.addWidget(QLabel("Select Channel:"))
+            self.channel_controls_layout.addWidget(self.channel_combo)
+            self.handle_channel_combo_changed(0)
         self.channel_controls_layout.addStretch()
 
     def clear_graphs(self):
         self.graph_layout.clear()
         self.curves = []
         self.plot_items = []
-        for cb in self.channel_checkboxes:
-            cb.setParent(None)
-        self.channel_checkboxes = []
+        if self.channel_combo is not None:
+            self.channel_combo.setParent(None)
+            self.channel_combo = None
 
     def update_status(self, message: str):
         self.status_label.setText(message)
@@ -196,27 +192,10 @@ class MainWindow(QMainWindow):
             plot_item.setYRange(-value, value)
         self.update_status(f"Vertical scale set to ±{value}")
 
-    def toggle_channel_visibility(self, channel_index, state):
-        if 0 <= channel_index < len(self.plot_items):
-            if self.focused_channel is not None:
-                # If focused, only allow the focused channel to be visible
-                self.plot_items[channel_index].setVisible(channel_index == self.focused_channel and state == 2)
-            else:
-                self.plot_items[channel_index].setVisible(state == 2)
-
-    def handle_focus_button(self, channel_index, checked):
-        if checked:
-            self.focused_channel = channel_index
-            for idx, plot_item in enumerate(self.plot_items):
-                plot_item.setVisible(idx == channel_index)
-            for idx, cb in enumerate(self.channel_checkboxes):
-                cb.setChecked(idx == channel_index)
-        else:
-            self.focused_channel = None
-            for plot_item in self.plot_items:
-                plot_item.setVisible(True)
-            for cb in self.channel_checkboxes:
-                cb.setChecked(True)
+    def handle_channel_combo_changed(self, index):
+        # Show only the selected channel, hide others
+        for idx, plot_item in enumerate(self.plot_items):
+            plot_item.setVisible(idx == index)
 
     def update_graph(self, data_chunk: np.ndarray):
         if self.num_channels == 0 or data_chunk.size == 0:
