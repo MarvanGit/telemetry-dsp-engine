@@ -39,6 +39,7 @@ class MainWindow(QMainWindow):
     RMS_SIGNAL = "rms"
     PROCESSED_SIGNAL = "processed"
     DEFAULT_REVIEW_SAMPLING_RATE = 2000
+    LIVE_BUFFER_SAMPLES = 4000
     DSP_LOW_CUT = 20.0
     DSP_HIGH_CUT = 450.0
     DSP_FILTER_ORDER = 4
@@ -131,7 +132,7 @@ class MainWindow(QMainWindow):
 
         self.curves = []
         self.plot_items = []
-        self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
+        self.emg_data_buffer = np.zeros((1, self.LIVE_BUFFER_SAMPLES), dtype=np.float64)
 
         self.configure_signal_view_options()
         self.load_review_data_source(self.data_file_path)
@@ -160,7 +161,7 @@ class MainWindow(QMainWindow):
             self.data_source = None
             self.num_channels = 0
             self.review_signal_cache = {}
-            self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
+            self.emg_data_buffer = np.zeros((1, self.LIVE_BUFFER_SAMPLES), dtype=np.float64)
             self.current_file_label.setText("File: -")
             self.sample_rate_label.setText("Sample Rate: -")
             self.channel_count_label.setText("Channels: -")
@@ -210,7 +211,7 @@ class MainWindow(QMainWindow):
         self.data_source = LiveDataSource()
         self.live_dsp = None
         self.num_channels = 0
-        self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
+        self.emg_data_buffer = np.zeros((1, self.LIVE_BUFFER_SAMPLES), dtype=np.float64)
         self.current_file_label.setText("File: -")
         self.sample_rate_label.setText("Sample Rate: -")
         self.channel_count_label.setText("Channels: -")
@@ -277,7 +278,10 @@ class MainWindow(QMainWindow):
 
         self.live_dsp = None
         if self.num_channels > 0:
-            self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
+            self.emg_data_buffer = np.zeros(
+                (self.num_channels, self.LIVE_BUFFER_SAMPLES),
+                dtype=np.float64,
+            )
         self.update_status(f"Live view set to {self.signal_view_combo.currentText()}.")
 
     def get_dsp_band(self, sampling_rate: float) -> tuple[float, float]:
@@ -287,6 +291,23 @@ class MainWindow(QMainWindow):
         if lowcut <= 0 or highcut <= lowcut:
             raise ValueError(f"Invalid DSP band for {sampling_rate} Hz sampling rate.")
         return lowcut, highcut
+
+    def get_current_sampling_rate(self) -> float:
+        sampling_rate = getattr(self.data_source, "sampling_rate", None)
+        try:
+            sampling_rate = float(sampling_rate)
+        except (TypeError, ValueError):
+            return float(self.DEFAULT_REVIEW_SAMPLING_RATE)
+        if sampling_rate <= 0:
+            return float(self.DEFAULT_REVIEW_SAMPLING_RATE)
+        return sampling_rate
+
+    def get_review_time_axis(self, sample_count: int) -> np.ndarray:
+        return np.arange(sample_count, dtype=np.float64) / self.get_current_sampling_rate()
+
+    def get_live_time_axis(self, sample_count: int) -> np.ndarray:
+        sampling_rate = self.get_current_sampling_rate()
+        return (np.arange(sample_count, dtype=np.float64) - sample_count + 1) / sampling_rate
 
     def build_graphs(self):
         self.graph_layout.clear()
@@ -298,7 +319,7 @@ class MainWindow(QMainWindow):
             plot_item = self.graph_layout.addPlot(row=channel_index, col=0)
             plot_item.showGrid(x=True, y=True, alpha=0.3)
             plot_item.setLabel("left", "EMG Amplitude (uV)")
-            plot_item.setLabel("bottom", "Sample Index (n)")
+            plot_item.setLabel("bottom", "Time (s)")
             plot_item.setYRange(-self.current_gain, self.current_gain)
             curve = plot_item.plot(
                 pen=pg.mkPen(color=(channel_index * 20 % 255, 100, 200), width=1)
@@ -357,8 +378,9 @@ class MainWindow(QMainWindow):
             self.update_status(f"Failed to apply review DSP: {exc}")
             return
 
+        time_axis = self.get_review_time_axis(self.emg_data_buffer.shape[1])
         for channel_index, curve in enumerate(self.curves):
-            curve.setData(self.emg_data_buffer[channel_index, :])
+            curve.setData(time_axis, self.emg_data_buffer[channel_index, :])
         self.update_status(f"Review view set to {self.signal_view_combo.currentText()}.")
 
     def get_review_signal_data(self, signal_view: str) -> np.ndarray:
@@ -398,7 +420,10 @@ class MainWindow(QMainWindow):
             return
 
         self.num_channels = live_channels
-        self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
+        self.emg_data_buffer = np.zeros(
+            (self.num_channels, self.LIVE_BUFFER_SAMPLES),
+            dtype=np.float64,
+        )
         self.channel_count_label.setText(f"Channels: {self.num_channels}")
         self.sample_rate_label.setText(f"Sample Rate: {self.data_source.sampling_rate} Hz")
         self.build_graphs()
@@ -425,7 +450,10 @@ class MainWindow(QMainWindow):
             return
 
         self.num_channels = data_chunk.shape[0]
-        self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
+        self.emg_data_buffer = np.zeros(
+            (self.num_channels, self.LIVE_BUFFER_SAMPLES),
+            dtype=np.float64,
+        )
         self.channel_count_label.setText(f"Channels: {self.num_channels}")
         self.build_graphs()
 
@@ -461,9 +489,10 @@ class MainWindow(QMainWindow):
         self.emg_data_buffer = np.roll(self.emg_data_buffer, -data_chunk.shape[1], axis=1)
         self.emg_data_buffer[:, -data_chunk.shape[1]:] = data_chunk
 
+        time_axis = self.get_live_time_axis(self.emg_data_buffer.shape[1])
         for channel_index, curve in enumerate(self.curves):
             if self.plot_items[channel_index].isVisible():
-                curve.setData(self.emg_data_buffer[channel_index, :])
+                curve.setData(time_axis, self.emg_data_buffer[channel_index, :])
 
     def start_data_stream(self):
         if self.current_mode == self.REVIEW_MODE:
