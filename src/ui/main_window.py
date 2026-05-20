@@ -1,37 +1,44 @@
 import os
+import pickle
+
 import numpy as np
+import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
+    QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QMainWindow,
     QPushButton,
     QScrollArea,
-    QFileDialog,
     QSlider,
-    QCheckBox,
-    QPushButton,
-    QComboBox
+    QVBoxLayout,
+    QWidget,
 )
-import pyqtgraph as pg
-from src.core.data_source import MockDataSource
+
+from src.core.data_source import FileDataSource, LiveDataSource
 from src.core.data_worker import DataWorker
 
 
 class MainWindow(QMainWindow):
     """
-    The MainWindow class is responsible for setting up the main user interface of the application.
-    It initializes the DataSource and DataWorker, and connects the data signals to the appropriate
-    slots for processing and visualization. This class serves as the central hub for managing
-    the application's data flow and user interactions.
+    Main application window for EMG visualization.
+
+    The UI now exposes the application's two data modes:
+    - Review: load a recorded dataset and render it statically.
+    - Live: reserve the streaming path for the hardware-backed data source.
     """
+
+    LIVE_MODE = "live"
+    REVIEW_MODE = "review"
+    DEFAULT_REVIEW_SAMPLING_RATE = 2000
 
     def __init__(self):
         super().__init__()
 
         self.data_file_path = os.path.join("data", "recording.pkl")
+        self.current_mode = self.REVIEW_MODE
         self.data_source = None
         self.data_worker = None
         self.num_channels = 0
@@ -46,18 +53,22 @@ class MainWindow(QMainWindow):
         self.layout = QVBoxLayout()
         self.central_widget.setLayout(self.layout)
 
-        # Header metadata display
         metadata_layout = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Review", self.REVIEW_MODE)
+        self.mode_combo.addItem("Live", self.LIVE_MODE)
+        self.mode_combo.currentIndexChanged.connect(self.handle_mode_changed)
         self.current_file_label = QLabel(f"File: {self.data_file_path}")
         self.sample_rate_label = QLabel("Sample Rate: -")
         self.channel_count_label = QLabel("Channels: -")
+        metadata_layout.addWidget(QLabel("Mode:"))
+        metadata_layout.addWidget(self.mode_combo)
         metadata_layout.addWidget(self.current_file_label)
         metadata_layout.addWidget(self.sample_rate_label)
         metadata_layout.addWidget(self.channel_count_label)
         metadata_layout.addStretch()
         self.layout.addLayout(metadata_layout)
 
-        # Controls for runtime interaction
         controls_layout = QHBoxLayout()
         self.start_button = QPushButton("Start")
         self.start_button.clicked.connect(self.start_data_stream)
@@ -76,7 +87,7 @@ class MainWindow(QMainWindow):
         self.gain_slider.setTickInterval(1)
         self.gain_slider.setSingleStep(1)
         self.gain_slider.valueChanged.connect(self.on_gain_changed)
-        self.gain_label = QLabel("Y Range: ±1")
+        self.gain_label = QLabel("Y Range: +/-1")
 
         controls_layout.addWidget(self.start_button)
         controls_layout.addWidget(self.pause_button)
@@ -87,11 +98,13 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.gain_slider)
         self.layout.addLayout(controls_layout)
 
-        # Status messages and information
         self.status_label = QLabel("Ready to load EMG data.")
         self.layout.addWidget(self.status_label)
 
-        # Scrolling plot container
+        self.channel_combo = None
+        self.channel_controls_layout = QHBoxLayout()
+        self.layout.addLayout(self.channel_controls_layout)
+
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.graph_layout = pg.GraphicsLayoutWidget()
@@ -101,27 +114,27 @@ class MainWindow(QMainWindow):
         self.curves = []
         self.plot_items = []
         self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
-        # Channel selection combo box
-        self.channel_combo = None
-        self.channel_controls_layout = QHBoxLayout()
-        self.layout.addLayout(self.channel_controls_layout)
-        self.load_data_source(self.data_file_path)
+
+        self.load_review_data_source(self.data_file_path)
+        self.refresh_mode_controls()
         self.statusBar().showMessage("Ready")
 
-    def load_data_source(self, file_path: str):
+    def load_review_data_source(self, file_path: str):
         if self.data_worker is not None and self.data_worker.isRunning():
             self.stop_data_stream()
 
         try:
-            self.data_source = MockDataSource(file_path=file_path, chunk_size=50)
-            self.num_channels = self.data_source.get_num_channels()
-            self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
+            sampling_rate = self.read_sampling_rate(file_path)
+            self.data_source = FileDataSource(file_path=file_path, sampling_rate=sampling_rate)
+            self.data_file_path = file_path
+            self.emg_data_buffer = self.data_source.get_data()
+            self.num_channels = self.emg_data_buffer.shape[0]
             self.current_file_label.setText(f"File: {os.path.basename(file_path)}")
             self.sample_rate_label.setText(f"Sample Rate: {self.data_source.sampling_rate} Hz")
             self.channel_count_label.setText(f"Channels: {self.num_channels}")
-            self.status_label.setText("Dataset loaded successfully.")
-            self.update_status("Dataset loaded. Click Start to begin streaming.")
+            self.update_status("Review dataset loaded.")
             self.build_graphs()
+            self.render_review_data()
         except Exception as exc:
             self.data_source = None
             self.num_channels = 0
@@ -129,9 +142,22 @@ class MainWindow(QMainWindow):
             self.current_file_label.setText("File: -")
             self.sample_rate_label.setText("Sample Rate: -")
             self.channel_count_label.setText("Channels: -")
-            self.status_label.setText(f"Failed to load file: {exc}")
-            self.update_status("Failed to load dataset.")
+            self.update_status(f"Failed to load file: {exc}")
             self.clear_graphs()
+        finally:
+            self.refresh_mode_controls()
+
+    def read_sampling_rate(self, file_path: str) -> int:
+        try:
+            with open(file_path, "rb") as file:
+                raw_data = pickle.load(file)
+            sampling_rate = raw_data.get("device_information", {}).get(
+                "sampling_frequency",
+                self.DEFAULT_REVIEW_SAMPLING_RATE,
+            )
+            return int(sampling_rate)
+        except Exception:
+            return self.DEFAULT_REVIEW_SAMPLING_RATE
 
     def open_data_file_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -141,27 +167,74 @@ class MainWindow(QMainWindow):
             "Pickle files (*.pkl);;All files (*)",
         )
         if file_path:
-            self.load_data_source(file_path)
+            self.load_review_data_source(file_path)
+
+    def handle_mode_changed(self):
+        selected_mode = self.mode_combo.currentData()
+        if selected_mode == self.current_mode:
+            return
+
+        if self.data_worker is not None and self.data_worker.isRunning():
+            self.stop_data_stream()
+
+        self.current_mode = selected_mode
+        self.clear_graphs()
+
+        if self.current_mode == self.REVIEW_MODE:
+            self.load_review_data_source(self.data_file_path)
+            return
+
+        self.data_source = LiveDataSource()
+        self.num_channels = 0
+        self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
+        self.current_file_label.setText("File: -")
+        self.sample_rate_label.setText("Sample Rate: -")
+        self.channel_count_label.setText("Channels: -")
+        self.update_status("Live mode selected. Hardware data source is not ready yet.")
+        self.refresh_mode_controls()
+
+    def refresh_mode_controls(self):
+        is_streaming = self.data_worker is not None and self.data_worker.isRunning()
+        is_review_mode = self.current_mode == self.REVIEW_MODE
+        can_stream_live = self.current_mode == self.LIVE_MODE and self.can_stream_live_data()
+
+        self.load_button.setEnabled(is_review_mode and not is_streaming)
+        self.start_button.setEnabled(can_stream_live and not is_streaming)
+        self.pause_button.setEnabled(is_streaming)
+        self.stop_button.setEnabled(is_streaming)
+        if not is_streaming:
+            self.pause_button.setText("Pause")
+            self.is_paused = False
+ 
+    # 
+    def can_stream_live_data(self) -> bool:
+        if self.data_source is None:
+            return False
+
+        get_chunk = getattr(self.data_source, "get_chunk", None)
+        sampling_rate = getattr(self.data_source, "sampling_rate", None)
+        chunk_size = getattr(self.data_source, "chunk_size", None)
+        return callable(get_chunk) and sampling_rate is not None and chunk_size is not None
 
     def build_graphs(self):
         self.graph_layout.clear()
         self.curves = []
         self.plot_items = []
-        self.channel_controls_layout.setParent(None)
-        self.channel_controls_layout = QHBoxLayout()
-        self.layout.insertLayout(3, self.channel_controls_layout)
-        
+        self.clear_channel_controls()
+
         for channel_index in range(self.num_channels):
             plot_item = self.graph_layout.addPlot(row=channel_index, col=0)
             plot_item.showGrid(x=True, y=True, alpha=0.3)
-            plot_item.setLabel("left", "EMG Amplitude (µV)")
+            plot_item.setLabel("left", "EMG Amplitude (uV)")
             plot_item.setLabel("bottom", "Sample Index (n)")
-            curve = plot_item.plot(pen=pg.mkPen(color=(channel_index * 20 % 255, 100, 200), width=1))
+            plot_item.setYRange(-self.current_gain, self.current_gain)
+            curve = plot_item.plot(
+                pen=pg.mkPen(color=(channel_index * 20 % 255, 100, 200), width=1)
+            )
             self.curves.append(curve)
             self.plot_items.append(plot_item)
             self.graph_layout.nextRow()
 
-        # Add combo box for channel selection
         self.channel_combo = None
         if self.num_channels > 0:
             self.channel_combo = QComboBox()
@@ -173,13 +246,19 @@ class MainWindow(QMainWindow):
             self.handle_channel_combo_changed(0)
         self.channel_controls_layout.addStretch()
 
+    def clear_channel_controls(self):
+        while self.channel_controls_layout.count():
+            item = self.channel_controls_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
     def clear_graphs(self):
         self.graph_layout.clear()
         self.curves = []
         self.plot_items = []
-        if self.channel_combo is not None:
-            self.channel_combo.setParent(None)
-            self.channel_combo = None
+        self.channel_combo = None
+        self.clear_channel_controls()
 
     def update_status(self, message: str):
         self.status_label.setText(message)
@@ -187,15 +266,21 @@ class MainWindow(QMainWindow):
 
     def on_gain_changed(self, value: int):
         self.current_gain = value
-        self.gain_label.setText(f"Y Range: ±{value}")
+        self.gain_label.setText(f"Y Range: +/-{value}")
         for plot_item in self.plot_items:
             plot_item.setYRange(-value, value)
-        self.update_status(f"Vertical scale set to ±{value}")
+        self.update_status(f"Vertical scale set to +/-{value}")
 
     def handle_channel_combo_changed(self, index):
-        # Show only the selected channel, hide others
         for idx, plot_item in enumerate(self.plot_items):
             plot_item.setVisible(idx == index)
+
+    def render_review_data(self):
+        if self.current_mode != self.REVIEW_MODE or self.num_channels == 0:
+            return
+
+        for channel_index, curve in enumerate(self.curves):
+            curve.setData(self.emg_data_buffer[channel_index, :])
 
     def update_graph(self, data_chunk: np.ndarray):
         if self.num_channels == 0 or data_chunk.size == 0:
@@ -209,8 +294,16 @@ class MainWindow(QMainWindow):
                 curve.setData(self.emg_data_buffer[channel_index, :])
 
     def start_data_stream(self):
+        if self.current_mode == self.REVIEW_MODE:
+            self.update_status("Review mode displays the loaded file directly.")
+            return
+
         if self.data_source is None:
             self.update_status("No data source available.")
+            return
+
+        if not self.can_stream_live_data():
+            self.update_status("Live data source is not ready for streaming yet.")
             return
 
         if self.data_worker is not None and self.data_worker.isRunning():
@@ -222,9 +315,7 @@ class MainWindow(QMainWindow):
         self.data_worker.finished.connect(self.on_worker_finished)
         self.data_worker.start()
 
-        self.start_button.setEnabled(False)
-        self.pause_button.setEnabled(True)
-        self.stop_button.setEnabled(True)
+        self.refresh_mode_controls()
         self.pause_button.setText("Pause")
         self.is_paused = False
         self.update_status("Streaming data in real time.")
@@ -250,25 +341,15 @@ class MainWindow(QMainWindow):
 
         self.data_worker.stop()
         self.data_worker = None
-
-        self.start_button.setEnabled(True)
-        self.pause_button.setEnabled(False)
-        self.pause_button.setText("Pause")
-        self.stop_button.setEnabled(False)
-        self.is_paused = False
+        self.refresh_mode_controls()
         self.update_status("Data stream stopped.")
 
     def on_worker_finished(self):
-        self.start_button.setEnabled(True)
-        self.pause_button.setEnabled(False)
-        self.pause_button.setText("Pause")
-        self.stop_button.setEnabled(False)
+        self.data_worker = None
+        self.refresh_mode_controls()
         self.update_status("Worker thread finished.")
 
     def closeEvent(self, event):
         if self.data_worker is not None and self.data_worker.isRunning():
             self.data_worker.stop()
         event.accept()
-
-
-
