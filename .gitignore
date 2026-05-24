@@ -5,6 +5,8 @@ env/
 
 # Python Cache
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 *.pyc
 *.pyo
 
