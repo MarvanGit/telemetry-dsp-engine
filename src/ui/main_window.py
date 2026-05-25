@@ -23,6 +23,10 @@ from src.core.data_source import FileDataSource, LiveDataSource
 from src.core.data_worker import DataWorker
 from src.core.dsp_live import DSPLive
 from src.core.dsp_review import DSPReview
+from src.core.event_annotation import (
+    EventAnnotationConfig,
+    detect_event_annotations,
+)
 from src.core.fatigue_analysis import FatigueAnalysisConfig
 from src.ui.fatigue_worker import FatigueLiveWorker, FatigueReviewWorker
 
@@ -52,6 +56,10 @@ class MainWindow(QMainWindow):
     FATIGUE_OVERLAP_PERCENT = 50
     FATIGUE_BUFFER_SECONDS = 10.0
     FATIGUE_ANALYSIS_INTERVAL_MS = 1000
+    EVENT_THRESHOLD_MULTIPLIER = 4.0
+    EVENT_MIN_DURATION_SECONDS = 0.15
+    EVENT_MERGE_GAP_SECONDS = 0.1
+    EVENT_MIN_PEAK_DISTANCE_SECONDS = 0.1
 
     def __init__(self):
         super().__init__()
@@ -70,6 +78,8 @@ class MainWindow(QMainWindow):
         self.fatigue_review_worker = None
         self.fatigue_live_worker = None
         self.fatigue_result = None
+        self.event_annotations = []
+        self.event_region_items = []
 
         self.setWindowTitle("EMG Data Visualization")
         self.resize(1000, 800)
@@ -106,6 +116,12 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_data_stream)
         self.load_button = QPushButton("Load File")
         self.load_button.clicked.connect(self.open_data_file_dialog)
+        self.annotate_events_button = QPushButton("Annotate Events")
+        self.annotate_events_button.clicked.connect(self.annotate_events)
+        self.clear_events_button = QPushButton("Clear Events")
+        self.clear_events_button.clicked.connect(
+            lambda: self.clear_event_annotations(update_status=True)
+        )
         self.signal_view_combo = QComboBox()
         self.signal_view_combo.currentIndexChanged.connect(self.handle_signal_view_changed)
 
@@ -121,6 +137,8 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.pause_button)
         controls_layout.addWidget(self.stop_button)
         controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(self.annotate_events_button)
+        controls_layout.addWidget(self.clear_events_button)
         controls_layout.addWidget(QLabel("Signal:"))
         controls_layout.addWidget(self.signal_view_combo)
         controls_layout.addStretch()
@@ -252,6 +270,7 @@ class MainWindow(QMainWindow):
             self.stop_data_stream()
         self.stop_fatigue_workers(wait=False)
         self.clear_fatigue_result()
+        self.clear_event_annotations()
 
         try:
             sampling_rate = self.read_sampling_rate(file_path)
@@ -311,6 +330,7 @@ class MainWindow(QMainWindow):
             self.stop_data_stream()
         self.stop_fatigue_workers(wait=False)
         self.clear_fatigue_result()
+        self.clear_event_annotations()
 
         self.current_mode = selected_mode
         self.clear_graphs()
@@ -343,6 +363,7 @@ class MainWindow(QMainWindow):
             is_review_mode and self.num_channels > 0
         ) or self.current_mode == self.LIVE_MODE
         self.signal_view_combo.setEnabled(can_select_signal_view)
+        self.refresh_event_controls()
         if not is_streaming:
             self.pause_button.setText("Pause")
             self.is_paused = False
@@ -423,6 +444,7 @@ class MainWindow(QMainWindow):
         return (np.arange(sample_count, dtype=np.float64) - sample_count + 1) / sampling_rate
 
     def build_graphs(self):
+        self.clear_event_regions()
         self.graph_layout.clear()
         self.curves = []
         self.plot_items = []
@@ -443,6 +465,7 @@ class MainWindow(QMainWindow):
         self.refresh_channel_options()
 
     def clear_graphs(self):
+        self.clear_event_regions()
         self.graph_layout.clear()
         self.curves = []
         self.plot_items = []
@@ -464,6 +487,7 @@ class MainWindow(QMainWindow):
         for idx, plot_item in enumerate(self.plot_items):
             plot_item.setVisible(idx == selected_channel)
         self.render_fatigue_result()
+        self.render_event_annotations()
 
     def refresh_fatigue_controls(self):
         if not hasattr(self, "fatigue_analyze_button"):
@@ -524,6 +548,101 @@ class MainWindow(QMainWindow):
         if selected_channel is None:
             return 0
         return int(selected_channel)
+
+    def refresh_event_controls(self):
+        if not hasattr(self, "annotate_events_button"):
+            return
+
+        is_review_ready = (
+            self.current_mode == self.REVIEW_MODE
+            and self.ORIGINAL_SIGNAL in self.review_signal_cache
+            and self.num_channels > 0
+        )
+        is_streaming = self.data_worker is not None and self.data_worker.isRunning()
+        self.annotate_events_button.setEnabled(is_review_ready and not is_streaming)
+        self.clear_events_button.setEnabled(bool(self.event_annotations))
+
+    def annotate_events(self):
+        if self.current_mode != self.REVIEW_MODE:
+            self.update_status("Event annotation is available in review mode.")
+            return
+        if self.ORIGINAL_SIGNAL not in self.review_signal_cache:
+            self.update_status("No review dataset is loaded.")
+            return
+
+        try:
+            rms_envelope = self.get_review_signal_data(self.RMS_SIGNAL)
+            config = EventAnnotationConfig(
+                threshold_multiplier=self.EVENT_THRESHOLD_MULTIPLIER,
+                min_duration_seconds=self.EVENT_MIN_DURATION_SECONDS,
+                merge_gap_seconds=self.EVENT_MERGE_GAP_SECONDS,
+                min_peak_distance_seconds=self.EVENT_MIN_PEAK_DISTANCE_SECONDS,
+            )
+            self.event_annotations = detect_event_annotations(
+                rms_envelope,
+                self.get_current_sampling_rate(),
+                config,
+            )
+        except Exception as exc:
+            self.event_annotations = []
+            self.clear_event_regions()
+            self.refresh_event_controls()
+            self.update_status(f"Event annotation failed: {exc}")
+            return
+
+        self.render_event_annotations()
+        self.refresh_event_controls()
+
+        channel_count = len({event.channel for event in self.event_annotations})
+        if self.event_annotations:
+            self.update_status(
+                f"Annotated {len(self.event_annotations)} event(s) across "
+                f"{channel_count} channel(s)."
+            )
+        else:
+            self.update_status("No contraction events found.")
+
+    def clear_event_annotations(self, update_status: bool = False):
+        self.event_annotations = []
+        self.clear_event_regions()
+        self.refresh_event_controls()
+        if update_status:
+            self.update_status("Event annotations cleared.")
+
+    def clear_event_regions(self):
+        for region_item in self.event_region_items:
+            try:
+                region_item.getViewBox().removeItem(region_item)
+            except (AttributeError, RuntimeError, ValueError):
+                pass
+        self.event_region_items = []
+
+    def render_event_annotations(self):
+        self.clear_event_regions()
+        if (
+            self.current_mode != self.REVIEW_MODE
+            or not self.event_annotations
+            or not self.plot_items
+        ):
+            return
+
+        selected_channel = self.get_selected_channel()
+        if selected_channel >= len(self.plot_items):
+            return
+
+        plot_item = self.plot_items[selected_channel]
+        for event in self.event_annotations:
+            if event.channel != selected_channel:
+                continue
+            region_item = pg.LinearRegionItem(
+                values=(event.start_time, event.end_time),
+                brush=(50, 190, 95, 55),
+                pen=pg.mkPen(color=(35, 150, 75, 150), width=1),
+                movable=False,
+            )
+            region_item.setZValue(-10)
+            plot_item.addItem(region_item)
+            self.event_region_items.append(region_item)
 
     def get_fatigue_config(self) -> FatigueAnalysisConfig:
         sampling_rate = self.get_current_sampling_rate()
