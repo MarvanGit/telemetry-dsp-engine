@@ -3,9 +3,10 @@ import pickle
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -21,6 +23,8 @@ from src.core.data_source import FileDataSource, LiveDataSource
 from src.core.data_worker import DataWorker
 from src.core.dsp_live import DSPLive
 from src.core.dsp_review import DSPReview
+from src.core.fatigue_analysis import FatigueAnalysisConfig
+from src.ui.fatigue_worker import FatigueLiveWorker, FatigueReviewWorker
 
 
 class MainWindow(QMainWindow):
@@ -44,6 +48,10 @@ class MainWindow(QMainWindow):
     DSP_HIGH_CUT = 450.0
     DSP_FILTER_ORDER = 4
     DSP_RMS_WINDOW_MS = 100.0
+    FATIGUE_WINDOW_SECONDS = 1.0
+    FATIGUE_OVERLAP_PERCENT = 50
+    FATIGUE_BUFFER_SECONDS = 10.0
+    FATIGUE_ANALYSIS_INTERVAL_MS = 1000
 
     def __init__(self):
         super().__init__()
@@ -59,6 +67,9 @@ class MainWindow(QMainWindow):
         self.current_gain = 1
         self.current_signal_view = self.ORIGINAL_SIGNAL
         self.is_paused = False
+        self.fatigue_review_worker = None
+        self.fatigue_live_worker = None
+        self.fatigue_result = None
 
         self.setWindowTitle("EMG Data Visualization")
         self.resize(1000, 800)
@@ -120,6 +131,8 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready to load EMG data.")
         self.layout.addWidget(self.status_label)
 
+        self.build_fatigue_controls()
+
         self.channel_combo = None
         self.channel_controls_layout = QHBoxLayout()
         self.layout.addLayout(self.channel_controls_layout)
@@ -130,6 +143,11 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidget(self.graph_layout)
         self.layout.addWidget(self.scroll_area)
 
+        self.fatigue_graph_layout = pg.GraphicsLayoutWidget()
+        self.fatigue_graph_layout.setMinimumHeight(320)
+        self.layout.addWidget(self.fatigue_graph_layout)
+        self.build_fatigue_plots()
+
         self.curves = []
         self.plot_items = []
         self.emg_data_buffer = np.zeros((1, self.LIVE_BUFFER_SAMPLES), dtype=np.float64)
@@ -139,9 +157,107 @@ class MainWindow(QMainWindow):
         self.refresh_mode_controls()
         self.statusBar().showMessage("Ready")
 
+    def build_fatigue_controls(self):
+        fatigue_controls_layout = QHBoxLayout()
+
+        self.fatigue_analyze_button = QPushButton("Analyze Fatigue")
+        self.fatigue_analyze_button.clicked.connect(self.start_fatigue_analysis)
+        self.fatigue_stop_button = QPushButton("Stop Analysis")
+        self.fatigue_stop_button.setEnabled(False)
+        self.fatigue_stop_button.clicked.connect(lambda: self.stop_fatigue_analysis())
+
+        self.fatigue_channel_combo = QComboBox()
+        self.fatigue_channel_combo.currentIndexChanged.connect(
+            self.handle_fatigue_channel_changed
+        )
+
+        self.fatigue_window_spin = QDoubleSpinBox()
+        self.fatigue_window_spin.setRange(0.1, 10.0)
+        self.fatigue_window_spin.setDecimals(1)
+        self.fatigue_window_spin.setSingleStep(0.1)
+        self.fatigue_window_spin.setSuffix(" s")
+        self.fatigue_window_spin.setValue(self.FATIGUE_WINDOW_SECONDS)
+
+        self.fatigue_overlap_spin = QSpinBox()
+        self.fatigue_overlap_spin.setRange(0, 90)
+        self.fatigue_overlap_spin.setSuffix(" %")
+        self.fatigue_overlap_spin.setValue(self.FATIGUE_OVERLAP_PERCENT)
+
+        self.fatigue_nfft_spin = QSpinBox()
+        self.fatigue_nfft_spin.setRange(0, 65536)
+        self.fatigue_nfft_spin.setSingleStep(256)
+        self.fatigue_nfft_spin.setSpecialValueText("Auto")
+        self.fatigue_nfft_spin.setValue(0)
+
+        self.fatigue_buffer_spin = QDoubleSpinBox()
+        self.fatigue_buffer_spin.setRange(1.0, 60.0)
+        self.fatigue_buffer_spin.setDecimals(1)
+        self.fatigue_buffer_spin.setSingleStep(1.0)
+        self.fatigue_buffer_spin.setSuffix(" s")
+        self.fatigue_buffer_spin.setValue(self.FATIGUE_BUFFER_SECONDS)
+
+        self.fatigue_metrics_label = QLabel("Fatigue: -")
+
+        fatigue_controls_layout.addWidget(self.fatigue_analyze_button)
+        fatigue_controls_layout.addWidget(self.fatigue_stop_button)
+        fatigue_controls_layout.addWidget(QLabel("Fatigue Channel:"))
+        fatigue_controls_layout.addWidget(self.fatigue_channel_combo)
+        fatigue_controls_layout.addWidget(QLabel("Window:"))
+        fatigue_controls_layout.addWidget(self.fatigue_window_spin)
+        fatigue_controls_layout.addWidget(QLabel("Overlap:"))
+        fatigue_controls_layout.addWidget(self.fatigue_overlap_spin)
+        fatigue_controls_layout.addWidget(QLabel("FFT:"))
+        fatigue_controls_layout.addWidget(self.fatigue_nfft_spin)
+        fatigue_controls_layout.addWidget(QLabel("Live Buffer:"))
+        fatigue_controls_layout.addWidget(self.fatigue_buffer_spin)
+        fatigue_controls_layout.addStretch()
+        fatigue_controls_layout.addWidget(self.fatigue_metrics_label)
+        self.layout.addLayout(fatigue_controls_layout)
+
+    def build_fatigue_plots(self):
+        self.fatigue_graph_layout.clear()
+
+        self.fatigue_psd_plot = self.fatigue_graph_layout.addPlot(
+            row=0,
+            col=0,
+            title="Welch PSD",
+        )
+        self.fatigue_psd_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.fatigue_psd_plot.setLabel("bottom", "Frequency", units="Hz")
+        self.fatigue_psd_plot.setLabel("left", "Power")
+        self.fatigue_psd_curve = self.fatigue_psd_plot.plot(
+            pen=pg.mkPen(color=(70, 140, 220), width=2)
+        )
+
+        self.fatigue_trend_plot = self.fatigue_graph_layout.addPlot(
+            row=1,
+            col=0,
+            title="Median Frequency",
+        )
+        self.fatigue_trend_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.fatigue_trend_plot.setLabel("bottom", "Time", units="s")
+        self.fatigue_trend_plot.setLabel("left", "Frequency", units="Hz")
+        self.fatigue_median_curve = self.fatigue_trend_plot.plot(
+            pen=pg.mkPen(color=(220, 120, 70), width=2)
+        )
+
+        self.fatigue_spectrogram_plot = self.fatigue_graph_layout.addPlot(
+            row=0,
+            col=1,
+            rowspan=2,
+            title="Spectrogram",
+        )
+        self.fatigue_spectrogram_plot.setLabel("bottom", "Time", units="s")
+        self.fatigue_spectrogram_plot.setLabel("left", "Frequency", units="Hz")
+        self.fatigue_spectrogram_item = pg.ImageItem()
+        self.fatigue_spectrogram_plot.addItem(self.fatigue_spectrogram_item)
+        self.clear_fatigue_result()
+
     def load_review_data_source(self, file_path: str):
         if self.data_worker is not None and self.data_worker.isRunning():
             self.stop_data_stream()
+        self.stop_fatigue_workers(wait=False)
+        self.clear_fatigue_result()
 
         try:
             sampling_rate = self.read_sampling_rate(file_path)
@@ -199,6 +315,8 @@ class MainWindow(QMainWindow):
 
         if self.data_worker is not None and self.data_worker.isRunning():
             self.stop_data_stream()
+        self.stop_fatigue_workers(wait=False)
+        self.clear_fatigue_result()
 
         self.current_mode = selected_mode
         self.clear_graphs()
@@ -234,6 +352,7 @@ class MainWindow(QMainWindow):
         if not is_streaming:
             self.pause_button.setText("Pause")
             self.is_paused = False
+        self.refresh_fatigue_controls()
 
     def can_stream_live_data(self) -> bool:
         if self.data_source is None:
@@ -338,6 +457,7 @@ class MainWindow(QMainWindow):
             self.channel_controls_layout.addWidget(self.channel_combo)
             self.handle_channel_combo_changed(0)
         self.channel_controls_layout.addStretch()
+        self.refresh_fatigue_channel_options()
 
     def clear_channel_controls(self):
         while self.channel_controls_layout.count():
@@ -352,6 +472,7 @@ class MainWindow(QMainWindow):
         self.plot_items = []
         self.channel_combo = None
         self.clear_channel_controls()
+        self.refresh_fatigue_channel_options()
 
     def update_status(self, message: str):
         self.status_label.setText(message)
@@ -367,6 +488,258 @@ class MainWindow(QMainWindow):
     def handle_channel_combo_changed(self, index):
         for idx, plot_item in enumerate(self.plot_items):
             plot_item.setVisible(idx == index)
+
+    def refresh_fatigue_controls(self):
+        if not hasattr(self, "fatigue_analyze_button"):
+            return
+
+        is_streaming = self.data_worker is not None and self.data_worker.isRunning()
+        is_running = self.is_fatigue_analysis_running()
+        review_ready = self.current_mode == self.REVIEW_MODE and self.num_channels > 0
+        live_ready = self.current_mode == self.LIVE_MODE and is_streaming
+
+        if self.current_mode == self.REVIEW_MODE:
+            self.fatigue_analyze_button.setText("Analyze Fatigue")
+        else:
+            self.fatigue_analyze_button.setText("Start Fatigue")
+
+        self.fatigue_analyze_button.setEnabled((review_ready or live_ready) and not is_running)
+        self.fatigue_stop_button.setEnabled(is_running)
+        self.fatigue_channel_combo.setEnabled(self.num_channels > 0)
+        self.fatigue_window_spin.setEnabled(not is_running)
+        self.fatigue_overlap_spin.setEnabled(not is_running)
+        self.fatigue_nfft_spin.setEnabled(not is_running)
+        self.fatigue_buffer_spin.setEnabled(
+            self.current_mode == self.LIVE_MODE and not is_running
+        )
+
+    def is_fatigue_analysis_running(self) -> bool:
+        review_running = (
+            self.fatigue_review_worker is not None and self.fatigue_review_worker.isRunning()
+        )
+        live_running = (
+            self.fatigue_live_worker is not None and self.fatigue_live_worker.isRunning()
+        )
+        return review_running or live_running
+
+    def refresh_fatigue_channel_options(self):
+        if not hasattr(self, "fatigue_channel_combo"):
+            return
+
+        previous_channel = self.fatigue_channel_combo.currentData()
+        if previous_channel is None:
+            previous_channel = 0
+
+        self.fatigue_channel_combo.blockSignals(True)
+        self.fatigue_channel_combo.clear()
+        selected_index = 0
+        for channel_index in range(self.num_channels):
+            self.fatigue_channel_combo.addItem(f"Channel {channel_index + 1}", channel_index)
+            if channel_index == previous_channel:
+                selected_index = channel_index
+        if self.num_channels > 0:
+            self.fatigue_channel_combo.setCurrentIndex(min(selected_index, self.num_channels - 1))
+        self.fatigue_channel_combo.blockSignals(False)
+        self.refresh_fatigue_controls()
+        self.render_fatigue_result()
+
+    def handle_fatigue_channel_changed(self, index=None):
+        self.render_fatigue_result()
+
+    def get_selected_fatigue_channel(self) -> int:
+        selected_channel = self.fatigue_channel_combo.currentData()
+        if selected_channel is None:
+            return 0
+        return int(selected_channel)
+
+    def get_fatigue_config(self) -> FatigueAnalysisConfig:
+        sampling_rate = self.get_current_sampling_rate()
+        lowcut, highcut = self.get_dsp_band(sampling_rate)
+        nfft = self.fatigue_nfft_spin.value()
+        return FatigueAnalysisConfig(
+            window_seconds=self.fatigue_window_spin.value(),
+            overlap_fraction=self.fatigue_overlap_spin.value() / 100.0,
+            nfft=None if nfft == 0 else nfft,
+            min_frequency=lowcut,
+            max_frequency=highcut,
+        )
+
+    def start_fatigue_analysis(self):
+        if self.is_fatigue_analysis_running():
+            return
+
+        if self.current_mode == self.REVIEW_MODE:
+            self.start_review_fatigue_analysis()
+            return
+
+        self.start_live_fatigue_analysis()
+
+    def start_review_fatigue_analysis(self):
+        if self.ORIGINAL_SIGNAL not in self.review_signal_cache:
+            self.update_status("No review dataset is loaded.")
+            return
+
+        try:
+            config = self.get_fatigue_config()
+        except Exception as exc:
+            self.update_status(f"Invalid fatigue settings: {exc}")
+            return
+
+        source_data = self.review_signal_cache[self.ORIGINAL_SIGNAL]
+        self.fatigue_review_worker = FatigueReviewWorker(
+            data=source_data,
+            sampling_rate=self.get_current_sampling_rate(),
+            config=config,
+        )
+        self.fatigue_review_worker.result_ready.connect(self.handle_fatigue_result)
+        self.fatigue_review_worker.error_signal.connect(self.handle_fatigue_error)
+        self.fatigue_review_worker.finished.connect(self.on_fatigue_review_finished)
+        self.fatigue_review_worker.start()
+        self.update_status("Running review fatigue analysis.")
+        self.refresh_fatigue_controls()
+
+    def start_live_fatigue_analysis(self):
+        if self.data_worker is None or not self.data_worker.isRunning():
+            self.update_status("Start live streaming before fatigue analysis.")
+            return
+
+        try:
+            config = self.get_fatigue_config()
+        except Exception as exc:
+            self.update_status(f"Invalid fatigue settings: {exc}")
+            return
+
+        self.fatigue_live_worker = FatigueLiveWorker(
+            sampling_rate=self.get_current_sampling_rate(),
+            config=config,
+            buffer_seconds=self.fatigue_buffer_spin.value(),
+            analysis_interval_ms=self.FATIGUE_ANALYSIS_INTERVAL_MS,
+        )
+        self.fatigue_live_worker.result_ready.connect(self.handle_fatigue_result)
+        self.fatigue_live_worker.error_signal.connect(self.handle_fatigue_error)
+        self.fatigue_live_worker.finished.connect(self.on_fatigue_live_finished)
+        self.fatigue_live_worker.start()
+        self.update_status("Live fatigue analysis started.")
+        self.refresh_fatigue_controls()
+
+    def stop_fatigue_analysis(self):
+        self.stop_fatigue_workers(wait=False)
+        self.update_status("Fatigue analysis stopped.")
+
+    def stop_fatigue_workers(self, wait: bool):
+        review_worker = self.fatigue_review_worker
+        if review_worker is not None:
+            review_worker.cancel()
+            if wait and review_worker.isRunning():
+                review_worker.wait(1000)
+
+        live_worker = self.fatigue_live_worker
+        if live_worker is not None:
+            live_worker.stop()
+            if wait and live_worker.isRunning():
+                live_worker.wait(1000)
+
+        self.refresh_fatigue_controls()
+
+    def on_fatigue_review_finished(self):
+        self.fatigue_review_worker = None
+        self.refresh_fatigue_controls()
+
+    def on_fatigue_live_finished(self):
+        self.fatigue_live_worker = None
+        self.refresh_fatigue_controls()
+
+    def handle_fatigue_error(self, message: str):
+        self.update_status(f"Fatigue analysis failed: {message}")
+
+    def handle_fatigue_result(self, result):
+        self.fatigue_result = result
+        self.render_fatigue_result()
+        self.update_status("Fatigue analysis updated.")
+
+    def submit_live_fatigue_chunk(self, data_chunk: np.ndarray):
+        if self.fatigue_live_worker is None or not self.fatigue_live_worker.isRunning():
+            return
+
+        try:
+            self.fatigue_live_worker.add_chunk(data_chunk)
+        except Exception as exc:
+            self.update_status(f"Could not queue fatigue chunk: {exc}")
+
+    def render_fatigue_result(self):
+        if not hasattr(self, "fatigue_psd_curve") or self.fatigue_result is None:
+            return
+        if self.num_channels == 0:
+            return
+
+        result = self.fatigue_result
+        channel_index = min(self.get_selected_fatigue_channel(), result.welch_power.shape[0] - 1)
+
+        self.fatigue_psd_curve.setData(
+            result.frequencies,
+            result.welch_power[channel_index],
+        )
+        self.fatigue_median_curve.setData(
+            result.times,
+            result.spectrogram_median_frequency[channel_index],
+        )
+
+        power = result.spectrogram_power[channel_index]
+        log_power = 10.0 * np.log10(np.maximum(power, np.finfo(np.float64).tiny))
+        self.fatigue_spectrogram_item.setImage(log_power.T, autoLevels=True)
+        self.set_fatigue_spectrogram_rect(result.times, result.frequencies)
+
+        self.fatigue_metrics_label.setText(
+            "Fatigue: "
+            f"Median {self.format_frequency(result.median_frequency[channel_index])} | "
+            f"Mean {self.format_frequency(result.mean_frequency[channel_index])} | "
+            f"Power {self.format_power(result.band_power[channel_index])}"
+        )
+
+    def clear_fatigue_result(self):
+        self.fatigue_result = None
+        if hasattr(self, "fatigue_psd_curve"):
+            self.fatigue_psd_curve.setData([], [])
+        if hasattr(self, "fatigue_median_curve"):
+            self.fatigue_median_curve.setData([], [])
+        if hasattr(self, "fatigue_spectrogram_item"):
+            self.fatigue_spectrogram_item.clear()
+        if hasattr(self, "fatigue_metrics_label"):
+            self.fatigue_metrics_label.setText("Fatigue: -")
+
+    def set_fatigue_spectrogram_rect(self, times: np.ndarray, frequencies: np.ndarray):
+        if times.size == 0 or frequencies.size == 0:
+            return
+
+        time_width = self.get_axis_width(times, self.fatigue_window_spin.value())
+        frequency_height = self.get_axis_width(frequencies, 1.0)
+        self.fatigue_spectrogram_item.setRect(
+            QRectF(
+                float(times[0]),
+                float(frequencies[0]),
+                time_width,
+                frequency_height,
+            )
+        )
+
+    @staticmethod
+    def get_axis_width(values: np.ndarray, default_width: float) -> float:
+        if values.size < 2:
+            return float(default_width)
+        width = float(values[-1] - values[0])
+        return width if width > 0.0 else float(default_width)
+
+    @staticmethod
+    def format_frequency(value: float) -> str:
+        if not np.isfinite(value):
+            return "-"
+        return f"{value:.1f} Hz"
+
+    @staticmethod
+    def format_power(value: float) -> str:
+        if not np.isfinite(value):
+            return "-"
+        return f"{value:.3g}"
 
     def render_review_data(self):
         if self.current_mode != self.REVIEW_MODE or self.num_channels == 0:
@@ -483,6 +856,7 @@ class MainWindow(QMainWindow):
             data_chunk = data_chunk.reshape(1, -1)
 
         if self.current_mode == self.LIVE_MODE:
+            self.submit_live_fatigue_chunk(data_chunk)
             data_chunk = self.process_live_chunk(data_chunk)
             self.prepare_live_display_for_chunk(data_chunk)
 
@@ -541,6 +915,7 @@ class MainWindow(QMainWindow):
         if self.data_worker is None:
             return
 
+        self.stop_fatigue_workers(wait=False)
         self.data_worker.stop()
         self.data_worker = None
         self.refresh_mode_controls()
@@ -552,6 +927,7 @@ class MainWindow(QMainWindow):
         self.update_status("Worker thread finished.")
 
     def closeEvent(self, event):
+        self.stop_fatigue_workers(wait=True)
         if self.data_worker is not None and self.data_worker.isRunning():
             self.data_worker.stop()
         event.accept()

@@ -44,7 +44,7 @@ jobs:
           PY
 
       - name: Lint DSP and tests with ruff
-        run: python -m ruff check src/core/dsp_live.py src/core/dsp_review.py tests
+        run: python -m ruff check src/core/dsp_live.py src/core/dsp_review.py src/core/fatigue_analysis.py tests
 
       - name: Run headless DSP validation tests
         run: python -m pytest
