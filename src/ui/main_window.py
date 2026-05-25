@@ -5,9 +5,11 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -15,6 +17,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -80,6 +84,7 @@ class MainWindow(QMainWindow):
         self.fatigue_result = None
         self.event_annotations = []
         self.event_region_items = []
+        self.is_populating_event_table = False
 
         self.setWindowTitle("EMG Data Visualization")
         self.resize(1000, 800)
@@ -157,6 +162,8 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidget(self.graph_layout)
         self.layout.addWidget(self.scroll_area)
 
+        self.build_event_table()
+
         self.fatigue_graph_layout = pg.GraphicsLayoutWidget()
         self.fatigue_graph_layout.setMinimumHeight(320)
         self.layout.addWidget(self.fatigue_graph_layout)
@@ -225,6 +232,31 @@ class MainWindow(QMainWindow):
         fatigue_controls_layout.addStretch()
         fatigue_controls_layout.addWidget(self.fatigue_metrics_label)
         self.layout.addLayout(fatigue_controls_layout)
+
+    def build_event_table(self):
+        self.event_table = QTableWidget(0, 7)
+        self.event_table.setHorizontalHeaderLabels(
+            (
+                "#",
+                "Channel",
+                "Start (s)",
+                "End (s)",
+                "Duration (s)",
+                "Peak (s)",
+                "Peak RMS",
+            )
+        )
+        self.event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.event_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.event_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.event_table.setAlternatingRowColors(True)
+        self.event_table.setMaximumHeight(180)
+        self.event_table.verticalHeader().setVisible(False)
+        header = self.event_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(True)
+        self.event_table.currentCellChanged.connect(self.handle_event_table_selection_changed)
+        self.layout.addWidget(self.event_table)
 
     def build_fatigue_plots(self):
         self.fatigue_graph_layout.clear()
@@ -586,12 +618,14 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.event_annotations = []
             self.clear_event_regions()
+            self.populate_event_table()
             self.refresh_event_controls()
             self.update_status(f"Event annotation failed: {exc}")
             return
 
         self.render_event_annotations()
         self.refresh_event_controls()
+        self.populate_event_table()
 
         channel_count = len({event.channel for event in self.event_annotations})
         if self.event_annotations:
@@ -605,6 +639,7 @@ class MainWindow(QMainWindow):
     def clear_event_annotations(self, update_status: bool = False):
         self.event_annotations = []
         self.clear_event_regions()
+        self.populate_event_table()
         self.refresh_event_controls()
         if update_status:
             self.update_status("Event annotations cleared.")
@@ -643,6 +678,68 @@ class MainWindow(QMainWindow):
             region_item.setZValue(-10)
             plot_item.addItem(region_item)
             self.event_region_items.append(region_item)
+
+    def populate_event_table(self):
+        if not hasattr(self, "event_table"):
+            return
+
+        self.is_populating_event_table = True
+        try:
+            self.event_table.setRowCount(len(self.event_annotations))
+            for row_index, event in enumerate(self.event_annotations):
+                duration = event.end_time - event.start_time
+                values = (
+                    str(row_index + 1),
+                    f"Channel {event.channel + 1}",
+                    f"{event.start_time:.3f}",
+                    f"{event.end_time:.3f}",
+                    f"{duration:.3f}",
+                    f"{event.peak_time:.3f}",
+                    f"{event.peak_value:.4g}",
+                )
+
+                for column_index, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.ItemDataRole.UserRole, row_index)
+                    self.event_table.setItem(row_index, column_index, item)
+
+            self.event_table.clearSelection()
+            self.event_table.setCurrentCell(-1, -1)
+        finally:
+            self.is_populating_event_table = False
+
+    def handle_event_table_selection_changed(
+        self,
+        current_row: int,
+        current_column: int,
+        previous_row: int,
+        previous_column: int,
+    ):
+        if self.is_populating_event_table or current_row < 0:
+            return
+
+        item = self.event_table.item(current_row, 0)
+        if item is None:
+            return
+
+        raw_event_index = item.data(Qt.ItemDataRole.UserRole)
+        if raw_event_index is None:
+            return
+
+        event_index = int(raw_event_index)
+        if event_index >= len(self.event_annotations):
+            return
+
+        event = self.event_annotations[event_index]
+        combo_index = self.channel_combo.findData(event.channel)
+        if combo_index >= 0 and combo_index != self.channel_combo.currentIndex():
+            self.channel_combo.setCurrentIndex(combo_index)
+        else:
+            self.render_event_annotations()
+
+        self.update_status(
+            f"Selected event {event_index + 1} on Channel {event.channel + 1}."
+        )
 
     def get_fatigue_config(self) -> FatigueAnalysisConfig:
         sampling_rate = self.get_current_sampling_rate()
