@@ -133,10 +133,6 @@ class MainWindow(QMainWindow):
 
         self.build_fatigue_controls()
 
-        self.channel_combo = None
-        self.channel_controls_layout = QHBoxLayout()
-        self.layout.addLayout(self.channel_controls_layout)
-
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.graph_layout = pg.GraphicsLayoutWidget()
@@ -166,10 +162,8 @@ class MainWindow(QMainWindow):
         self.fatigue_stop_button.setEnabled(False)
         self.fatigue_stop_button.clicked.connect(lambda: self.stop_fatigue_analysis())
 
-        self.fatigue_channel_combo = QComboBox()
-        self.fatigue_channel_combo.currentIndexChanged.connect(
-            self.handle_fatigue_channel_changed
-        )
+        self.channel_combo = QComboBox()
+        self.channel_combo.currentIndexChanged.connect(self.handle_channel_selection_changed)
 
         self.fatigue_window_spin = QDoubleSpinBox()
         self.fatigue_window_spin.setRange(0.1, 10.0)
@@ -200,8 +194,8 @@ class MainWindow(QMainWindow):
 
         fatigue_controls_layout.addWidget(self.fatigue_analyze_button)
         fatigue_controls_layout.addWidget(self.fatigue_stop_button)
-        fatigue_controls_layout.addWidget(QLabel("Fatigue Channel:"))
-        fatigue_controls_layout.addWidget(self.fatigue_channel_combo)
+        fatigue_controls_layout.addWidget(QLabel("Channel:"))
+        fatigue_controls_layout.addWidget(self.channel_combo)
         fatigue_controls_layout.addWidget(QLabel("Window:"))
         fatigue_controls_layout.addWidget(self.fatigue_window_spin)
         fatigue_controls_layout.addWidget(QLabel("Overlap:"))
@@ -432,7 +426,6 @@ class MainWindow(QMainWindow):
         self.graph_layout.clear()
         self.curves = []
         self.plot_items = []
-        self.clear_channel_controls()
 
         for channel_index in range(self.num_channels):
             plot_item = self.graph_layout.addPlot(row=channel_index, col=0)
@@ -447,32 +440,13 @@ class MainWindow(QMainWindow):
             self.plot_items.append(plot_item)
             self.graph_layout.nextRow()
 
-        self.channel_combo = None
-        if self.num_channels > 0:
-            self.channel_combo = QComboBox()
-            for channel_index in range(self.num_channels):
-                self.channel_combo.addItem(f"Channel {channel_index + 1}", channel_index)
-            self.channel_combo.currentIndexChanged.connect(self.handle_channel_combo_changed)
-            self.channel_controls_layout.addWidget(QLabel("Select Channel:"))
-            self.channel_controls_layout.addWidget(self.channel_combo)
-            self.handle_channel_combo_changed(0)
-        self.channel_controls_layout.addStretch()
-        self.refresh_fatigue_channel_options()
-
-    def clear_channel_controls(self):
-        while self.channel_controls_layout.count():
-            item = self.channel_controls_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        self.refresh_channel_options()
 
     def clear_graphs(self):
         self.graph_layout.clear()
         self.curves = []
         self.plot_items = []
-        self.channel_combo = None
-        self.clear_channel_controls()
-        self.refresh_fatigue_channel_options()
+        self.refresh_channel_options()
 
     def update_status(self, message: str):
         self.status_label.setText(message)
@@ -485,9 +459,11 @@ class MainWindow(QMainWindow):
             plot_item.setYRange(-value, value)
         self.update_status(f"Vertical scale set to +/-{value}")
 
-    def handle_channel_combo_changed(self, index):
+    def handle_channel_selection_changed(self, index=None):
+        selected_channel = self.get_selected_channel()
         for idx, plot_item in enumerate(self.plot_items):
-            plot_item.setVisible(idx == index)
+            plot_item.setVisible(idx == selected_channel)
+        self.render_fatigue_result()
 
     def refresh_fatigue_controls(self):
         if not hasattr(self, "fatigue_analyze_button"):
@@ -505,7 +481,7 @@ class MainWindow(QMainWindow):
 
         self.fatigue_analyze_button.setEnabled((review_ready or live_ready) and not is_running)
         self.fatigue_stop_button.setEnabled(is_running)
-        self.fatigue_channel_combo.setEnabled(self.num_channels > 0)
+        self.channel_combo.setEnabled(self.num_channels > 0)
         self.fatigue_window_spin.setEnabled(not is_running)
         self.fatigue_overlap_spin.setEnabled(not is_running)
         self.fatigue_nfft_spin.setEnabled(not is_running)
@@ -522,32 +498,29 @@ class MainWindow(QMainWindow):
         )
         return review_running or live_running
 
-    def refresh_fatigue_channel_options(self):
-        if not hasattr(self, "fatigue_channel_combo"):
+    def refresh_channel_options(self):
+        if not hasattr(self, "channel_combo"):
             return
 
-        previous_channel = self.fatigue_channel_combo.currentData()
+        previous_channel = self.channel_combo.currentData()
         if previous_channel is None:
             previous_channel = 0
 
-        self.fatigue_channel_combo.blockSignals(True)
-        self.fatigue_channel_combo.clear()
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
         selected_index = 0
         for channel_index in range(self.num_channels):
-            self.fatigue_channel_combo.addItem(f"Channel {channel_index + 1}", channel_index)
+            self.channel_combo.addItem(f"Channel {channel_index + 1}", channel_index)
             if channel_index == previous_channel:
                 selected_index = channel_index
         if self.num_channels > 0:
-            self.fatigue_channel_combo.setCurrentIndex(min(selected_index, self.num_channels - 1))
-        self.fatigue_channel_combo.blockSignals(False)
+            self.channel_combo.setCurrentIndex(min(selected_index, self.num_channels - 1))
+        self.channel_combo.blockSignals(False)
         self.refresh_fatigue_controls()
-        self.render_fatigue_result()
+        self.handle_channel_selection_changed()
 
-    def handle_fatigue_channel_changed(self, index=None):
-        self.render_fatigue_result()
-
-    def get_selected_fatigue_channel(self) -> int:
-        selected_channel = self.fatigue_channel_combo.currentData()
+    def get_selected_channel(self) -> int:
+        selected_channel = self.channel_combo.currentData()
         if selected_channel is None:
             return 0
         return int(selected_channel)
@@ -673,7 +646,7 @@ class MainWindow(QMainWindow):
             return
 
         result = self.fatigue_result
-        channel_index = min(self.get_selected_fatigue_channel(), result.welch_power.shape[0] - 1)
+        channel_index = min(self.get_selected_channel(), result.welch_power.shape[0] - 1)
 
         self.fatigue_psd_curve.setData(
             result.frequencies,
